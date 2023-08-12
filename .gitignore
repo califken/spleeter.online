@@ -1,3 +1,8 @@
+environment.ts
+environment.prod.ts
+.env
+config/serviceAccount.json
+config/firebaseDatabaseURL.json
 # Logs
 logs
 *.log
@@ -6,10 +11,15 @@ yarn-debug.log*
 yarn-error.log*
 lerna-debug.log*
 .pnpm-debug.log*
-pretrained_models*
+express/archives/*
+express/pretrained_models/*
+express/uploads/*
 config*
 g.json
 config/g.json
+web/ngspleeter/node_modules
+web/ngspleeter/
+.DS_Store
 # Diagnostic reports (https://nodejs.org/api/report.html)
 report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
 
