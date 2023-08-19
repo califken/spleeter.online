@@ -1,122 +1,95 @@
-const archiver = require('archiver');
+const admin = require('firebase-admin');
+const fetch = require('node-fetch');
+const fs = require('fs-extra');
 const { exec } = require('child_process');
-const express = require('express');
-const multer = require('multer');
-const db = require('./firebaseAdmin.js');
-const fs = require('fs');
-const path = require('path');
+const archiver = require('archiver');
 const { v4: uuidv4 } = require('uuid');
 
-const app = express();
+const serviceAccount = require("../config/serviceAccount.json");
+const firebaseDatabaseURL = require("../config/firebaseDatabaseURL.json");
 
-const storage = multer.diskStorage({
-    destination: (req, file, cb) => {
-        cb(null, './uploads/');
-    },
-    filename: (req, file, cb) => {
-        cb(null, file.originalname);
-    }
+admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+    databaseURL: firebaseDatabaseURL.firebaseDatabaseURL
 });
 
-const upload = multer({ storage: storage });
+const { Storage } = require('@google-cloud/storage');
+const storageClient = new Storage();
+const db = admin.database();
+const storage = admin.storage();
 
-app.post('/upload', upload.single('file'), (req, res) => {
-    if (!req.file) {
-        return res.status(400).send('No file uploaded.');
+function serviceLog(message, userId) {
+    const timestamp = new Date().toISOString();
+    const logMessage = `[${timestamp}] [User ID: ${userId}] - ${message}\n`;
+    fs.appendFileSync('log.txt', logMessage);
+}
+
+db.ref('/files').on('child_added', async snapshot => {
+    const fileData = snapshot.val();
+    const userId = fileData.UserUID;  // Assuming the userId is stored with this key
+    let filedatajson = JSON.stringify(fileData);
+    serviceLog(`${filedatajson}`, userId);
+
+    if (fileData.Output) {
+        serviceLog('Output already exists. Skipping processing...', userId);
+        return;
     }
 
-    const key = uuidv4();
-    const newDirectoryPath = path.join(__dirname, 'uploads', key);
+    try {
+        serviceLog('New file detected, updating status to processing...', userId);
+        snapshot.ref.update({ JobStatus: 'processing' });
 
-    if (!fs.existsSync(newDirectoryPath)) {
-        fs.mkdirSync(newDirectoryPath);
-    }
+        serviceLog('Downloading the audio file...', userId);
+        const response = await fetch(fileData.FilePath);
+        const buffer = await response.buffer();
 
-    const oldFilePath = path.join(__dirname, 'uploads', req.file.filename);
-    const newFilePath = path.join(newDirectoryPath, req.file.filename);
-    fs.renameSync(oldFilePath, newFilePath);
+        const parsedURL = new URL(fileData.FilePath);
+        const pathNameSplit = parsedURL.pathname.split('/');
+        const originalFileName = pathNameSplit[pathNameSplit.length - 1];
+        const fileExtension = originalFileName.split('.').pop();
 
-    const newJobRef = db.ref(`/jobs/${key}`);
-    newJobRef.set({
-        filename: req.file.filename,
-        key: key
-    }, error => {
-        if (error) {
-            return res.status(500).send('Error saving to Firebase.');
-        }
-        console.log(key);
-        res.json({ key: key });
-    });
-});
+        const newUUID = uuidv4();
+        serviceLog(`Generated new UUID: ${newUUID}`, userId);
 
-const jobsRef = db.ref('/jobs');
-let initialJobKeys = new Set();
+        const newFileName = `${newUUID}.${fileExtension}`;
+        const audioDir = `./audio/${newUUID}`;
 
-jobsRef.once('value', snapshot => {
-    snapshot.forEach(childSnapshot => {
-        initialJobKeys.add(childSnapshot.key);
-    });
+        snapshot.ref.update({ UUIDFileName: newUUID });
 
-    jobsRef.on('child_added', childSnapshot => {
-        if (initialJobKeys.has(childSnapshot.key)) {
-            return;
-        }
+        serviceLog('Saving file to local directory...', userId);
+        await fs.ensureDir(audioDir);
+        await fs.writeFile(`${audioDir}/${newFileName}`, buffer);
 
-        const jobData = childSnapshot.val();
+        serviceLog('Running spleeter...', userId);
+        exec(`spleeter separate ${audioDir}/${newFileName} -o ${audioDir}`, async (error) => {
+            if (error) {
+                serviceLog(`Spleeter execution error: ${error}`, userId);
+                return;
+            }
 
-        if (jobData && jobData.filename && !jobData.progress) {
-            childSnapshot.ref.update({ progress: 'spleeting' });
+            serviceLog('Spleeter processing complete, archiving the results...', userId);
+            const output = fs.createWriteStream(`./audio/${newUUID}/${newUUID}.zip`);
+            const archive = archiver('zip', { zlib: { level: 9 } });
+            archive.directory(`./audio/${newUUID}/${newUUID}`, false);
+            archive.pipe(output);
+            archive.finalize();
 
-            let spleetercommand = `spleeter separate uploads/${jobData.key}/${jobData.filename} -o uploads/${jobData.key}/output/`;
-            console.log(spleetercommand);
+            output.on('close', async () => {
+                serviceLog('Archive created, uploading to Firebase Storage...', userId);
+                const bucket = storage.bucket('spleetee.appspot.com');
+                await bucket.upload(`${audioDir}/${newUUID}.zip`);
 
-            exec(spleetercommand, (error, stdout, stderr) => {
-                if (error) {
-                    console.error(`Error running spleeter: ${error}`);
-                    childSnapshot.ref.update({ progress: 'error' });
-                    return;
-                }
+                const file = bucket.file(`${newUUID}.zip`);
+                const [url] = await file.getSignedUrl({ version: 'v4', action: 'read', expires: Date.now() + 1000 * 60 * 60 });
+                serviceLog('Upload complete. Updating RTDB with download URL...', userId);
+                await snapshot.ref.update({ Output: url, JobStatus: 'complete' });
 
-                childSnapshot.ref.update({ progress: 'zipping' });
-
-                const outputDir = path.join(__dirname, 'uploads', jobData.key, 'output');
-                const archivePath = path.join(__dirname, 'archives', `${jobData.key}.zip`);
-                const archive = archiver('zip', {
-                    zlib: { level: 9 }
-                });
-
-                const output = fs.createWriteStream(archivePath);
-                archive.pipe(output);
-                archive.directory(outputDir, false);
-                archive.finalize();
-
-                output.on('close', () => {
-                    console.log(`Archived to ${archivePath}`);
-                    fs.rmSync(path.join(__dirname, 'uploads', jobData.key), { recursive: true });
-                    childSnapshot.ref.update({ progress: 'complete' });
-                });
+                serviceLog(`Deleting directory: ${audioDir}`, userId);
+                await fs.remove(audioDir);
             });
-        }
-    });
-});
+        });
 
-app.get('/download/:key', (req, res) => {
-    const key = req.params.key;
-    const archivePath = path.join(__dirname, 'archives', `${key}.zip`);
-
-    if (fs.existsSync(archivePath)) {
-        res.sendFile(archivePath);
-    } else {
-        res.status(404).send('File not found.');
+    } catch (error) {
+        serviceLog(`An error occurred: ${error}`, userId);
     }
 });
-
-const angularDistFolder = path.join(__dirname, '../web/spleeter');
-app.use(express.static(angularDistFolder));
-
-app.get('*', (req, res) => {
-    res.sendFile(path.join(angularDistFolder, 'index.html'));
-});
-
-const port = 80;
-app.listen(port, () => console.log(`Server is listening on port ${port}`));
