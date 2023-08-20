@@ -61,7 +61,7 @@ db.ref('/files').on('child_added', async snapshot => {
         await fs.writeFile(`${audioDir}/${newFileName}`, buffer);
 
         serviceLog('Running spleeter...', userId);
-        exec(`spleeter separate ${audioDir}/${newFileName} -o ${audioDir}`, async (error) => {
+        exec(`spleeter separate ${audioDir}/${newFileName} -p spleeter:5stems -o ${audioDir}`, async (error) => {
             if (error) {
                 serviceLog(`Spleeter execution error: ${error}`, userId);
                 return;
@@ -74,19 +74,26 @@ db.ref('/files').on('child_added', async snapshot => {
             archive.pipe(output);
             archive.finalize();
 
-            output.on('close', async () => {
-                serviceLog('Archive created, uploading to Firebase Storage...', userId);
-                const bucket = storage.bucket('spleetee.appspot.com');
-                await bucket.upload(`${audioDir}/${newUUID}.zip`);
+            
+        output.on('close', async () => {
+          serviceLog('Archive created, uploading to Firebase Storage...', userId);
+          const bucket = storage.bucket('spleetee.appspot.com');
 
-                const file = bucket.file(`${newUUID}.zip`);
-                const [url] = await file.getSignedUrl({ version: 'v4', action: 'read', expires: Date.now() + 1000 * 60 * 60 });
-                serviceLog('Upload complete. Updating RTDB with download URL...', userId);
-                await snapshot.ref.update({ Output: url, JobStatus: 'complete' });
+          // Updating the file path to include the user's UID
+          const firebaseFilePath = `files/${userId}/${newUUID}.zip`;
 
-                serviceLog(`Deleting directory: ${audioDir}`, userId);
-                await fs.remove(audioDir);
-            });
+          await bucket.upload(`${audioDir}/${newUUID}.zip`, {
+              destination: firebaseFilePath
+          });
+
+          const file = bucket.file(firebaseFilePath);
+          const [url] = await file.getSignedUrl({ version: 'v4', action: 'read', expires: Date.now() + 1000 * 60 * 60 });
+          serviceLog('Upload complete. Updating RTDB with download URL...', userId);
+          await snapshot.ref.update({ Output: url, JobStatus: 'complete' });
+
+          serviceLog(`Deleting directory: ${audioDir}`, userId);
+          await fs.remove(audioDir);
+      });
         });
 
     } catch (error) {
