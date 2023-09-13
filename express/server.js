@@ -81,8 +81,8 @@ db.ref('/bundles').on('child_added', async snapshot => {
           const [url] = await file.getSignedUrl({ version: 'v4', action: 'read', expires: Date.now() + 1000 * 60 * 60 });
           serviceLog('Upload complete. Updating RTDB with download URL...', userId);
           await snapshot.ref.update({ Output: url, JobStatus: 'complete' });
-          db.ref(`${bundleData.sesssionPath}/download`).set(url);
-          db.ref(`${bundleData.sesssionPath}/status`).set('download');
+          db.ref(`${bundleData.sessionPath}/download`).set(url);
+          db.ref(`${bundleData.sessionPath}/status`).set('download');
           serviceLog(`Deleting directory: ${audioDir}`, userId);
         //   await fs.remove(audioDir);
       });
