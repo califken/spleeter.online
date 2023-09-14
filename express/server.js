@@ -1,6 +1,7 @@
 const admin = require('firebase-admin');
 const fetch = require('node-fetch');
-const fs = require('fs-extra');
+const fs = require('fs').promises;
+const fsextra = require('fs-extra');
 const { exec } = require('child_process');
 const archiver = require('archiver');
 const { v4: uuidv4 } = require('uuid');
@@ -24,149 +25,111 @@ function serviceLog(message, userId) {
     fs.appendFileSync('log.txt', logMessage);
 }
 
-
-
-
-db.ref('/bundles').on('child_added', async snapshot => {
-    const bundleData = snapshot.val();
-    const userId = bundleData.uid;  // Assuming the userId is stored with this key
-    let filedatajson = JSON.stringify(bundleData);
-    serviceLog(`${filedatajson}`, userId);
-
+async function processSession(sessionKEY, downloadURL) {
     try {
-        
-        serviceLog('Downloading the audio file...', userId);
-        const response = await fetch(bundleData.downloadURL);
+
+        db.ref(`/statuses/${sessionKEY}`).set('Fetching');
+
+        const audioFilePath = await downloadAudio(sessionKEY, downloadURL);
+        console.log('Downloaded audio:', audioFilePath);
+
+        db.ref(`/statuses/${sessionKEY}`).set('Processing');
+        await runSpleeter(sessionKEY);
+        console.log('Spleeter completed successfully');
+
+        db.ref(`/statuses/${sessionKEY}`).set('Zipping');
+        await zipAudio(sessionKEY);
+        console.log('Zipped audio!');
+
+        db.ref(`/statuses/${sessionKEY}`).set('Sending');
+        const uploadedUrl = await uploadAudioStemsArchive(sessionKEY);
+        console.log('Uploaded audio stems archive:', uploadedUrl);
+
+        db.ref(`/statuses/${sessionKEY}`).set('download');
+        db.ref(`/downloads/${sessionKEY}`).set(uploadedUrl)
+        db.ref(`/uploads/${sessionKEY}`).remove();
+    } catch (error) {
+        console.error('Error processing session:', error);
+        // Handle errors here
+    }
+}
+
+    db.ref('/uploads').on('child_added', async snapshot => {
+      const newupload = snapshot.val();
+      const sessionKEY = snapshot.key;
+      console.log(newupload,sessionKEY);
+      processSession(sessionKEY, newupload);
+    });
+
+async function downloadAudio(sessionKEY, downloadURL) {
+    try {
+        const response = await fetch(downloadURL);
         const buffer = await response.buffer();
 
-        const parsedURL = new URL(bundleData.downloadURL);
+        const parsedURL = new URL(downloadURL);
         const pathNameSplit = parsedURL.pathname.split('/');
         const originalFileName = pathNameSplit[pathNameSplit.length - 1];
-        const fileExtension = originalFileName.split('.').pop();
-        
-        
 
-        const audioDir = `./audio/${bundleData.uuid}`;
-        serviceLog('Saving file to local directory...', userId);
-        await fs.ensureDir(audioDir);
-        await fs.writeFile(`${audioDir}/${bundleData.uuid}.mp3`, buffer);
+        const audioDir = `./audio/${sessionKEY}`;
+        await fs.mkdir(audioDir, { recursive: true }); // Ensure the directory exists
+        const audioFilePath = `${audioDir}/${sessionKEY}.mp3`;
+        await fs.writeFile(audioFilePath, buffer);
+        console.log(audioFilePath);
+        return audioFilePath;
+    } catch (error) {
+        console.error('Error downloading audio:', error);
+        throw error; // Re-throw the error for the caller to handle
+    }
+}
 
-        serviceLog('Running spleeter...', userId);
-        exec(`spleeter separate ${audioDir}/${bundleData.uuid}.mp3 -p spleeter:5stems -o ${audioDir}`, async (error) => {
+async function runSpleeter(sessionKEY) {
+    return new Promise((resolve, reject) => {
+        const spleetercmd = `spleeter separate ./audio/${sessionKEY}/${sessionKEY}.mp3 -p spleeter:5stems -o ./audio/${sessionKEY}/`;
+        console.log(spleetercmd);
+        exec(spleetercmd, async (error) => {
             if (error) {
-                serviceLog(`Spleeter execution error: ${error}`, userId);
+                console.log(`Spleeter execution error: ${error}`);
+                reject(error); // Reject the Promise if there is an error
                 return;
             }
+            resolve(true); // Resolve the Promise when Spleeter completes successfully
+        });
+    });
+}
 
-            serviceLog('Spleeter processing complete, archiving the results...', userId);
-            const output = fs.createWriteStream(`./audio/${bundleData.uuid}.zip`);
-            const archive = archiver('zip', { zlib: { level: 9 } });
-            archive.directory(`${audioDir}`, false);
-            archive.pipe(output);
-            archive.finalize();
+async function zipAudio(sessionKEY) {
+    return new Promise((resolve, reject) => {
+        const output = fsextra.createWriteStream(`./audio/${sessionKEY}.zip`);
+        const archive = archiver('zip', { zlib: { level: 9 } });
 
-            
-        output.on('close', async () => {
-          serviceLog('Archive created, uploading to Firebase Storage...', userId);
-          const bucket = storage.bucket('spleetee.appspot.com');
+        archive.directory(`./audio/${sessionKEY}/${sessionKEY}`, false);
+        archive.pipe(output);
 
-          // Updating the file path to include the user's UID
-          const firebaseFilePath = `files/${bundleData.uid}/${bundleData.uuid}.zip`;
-
-          await bucket.upload(`./audio/${bundleData.uuid}.zip`, {
-              destination: firebaseFilePath
-          });
-
-          const file = bucket.file(firebaseFilePath);
-          const [url] = await file.getSignedUrl({ version: 'v4', action: 'read', expires: Date.now() + 1000 * 60 * 60 });
-          serviceLog('Upload complete. Updating RTDB with download URL...', userId);
-          await snapshot.ref.update({ Output: url, status: 'download' });
-          db.ref(`${bundleData.sessionPath}/download`).set(url);
-          db.ref(`${bundleData.sessionPath}/status`).set('download');
-          serviceLog(`Deleting directory: ${audioDir}`, userId);
-        //   await fs.remove(audioDir);
-      });
+        output.on('close', () => {
+            resolve(true); // Resolve the Promise when the zip operation is complete.
         });
 
+        output.on('error', (err) => {
+            reject(err); // Reject the Promise if there is an error.
+        });
+
+        archive.finalize();
+    });
+}
+
+async function uploadAudioStemsArchive(sessionKEY) {
+    try {
+        const bucket = storage.bucket('spleetee.appspot.com');
+        const firebaseFilePath = `files/${sessionKEY}.zip`;
+        await bucket.upload(`./audio/${sessionKEY}.zip`, {
+            destination: firebaseFilePath
+        });
+        const file = bucket.file(firebaseFilePath);
+        const [url] = await file.getSignedUrl({ version: 'v4', action: 'read', expires: Date.now() + 1000 * 60 * 60 });
+        return url;
     } catch (error) {
-        serviceLog(`An error occurred: ${error}`, userId);
+        console.error('Error uploading audio stems archive:', error);
+        throw error; // Re-throw the error for the caller to handle
     }
-});
+}
 
-
-// db.ref('/files').on('child_added', async snapshot => {
-//     const fileData = snapshot.val();
-//     const userId = fileData.UserUID;  // Assuming the userId is stored with this key
-//     let filedatajson = JSON.stringify(fileData);
-//     serviceLog(`${filedatajson}`, userId);
-
-//     if (fileData.Output) {
-//         serviceLog('Output already exists. Skipping processing...', userId);
-//         return;
-//     }
-
-//     try {
-//         serviceLog('New file detected, updating status to processing...', userId);
-//         snapshot.ref.update({ JobStatus: 'processing' });
-
-//         serviceLog('Downloading the audio file...', userId);
-//         const response = await fetch(fileData.FilePath);
-//         const buffer = await response.buffer();
-
-//         const parsedURL = new URL(fileData.FilePath);
-//         const pathNameSplit = parsedURL.pathname.split('/');
-//         const originalFileName = pathNameSplit[pathNameSplit.length - 1];
-//         const fileExtension = originalFileName.split('.').pop();
-
-//         const newUUID = uuidv4();
-//         serviceLog(`Generated new UUID: ${newUUID}`, userId);
-
-//         const newFileName = `${newUUID}.${fileExtension}`;
-//         const audioDir = `./audio/${newUUID}`;
-
-//         snapshot.ref.update({ UUIDFileName: newUUID });
-
-//         serviceLog('Saving file to local directory...', userId);
-//         await fs.ensureDir(audioDir);
-//         await fs.writeFile(`${audioDir}/${newFileName}`, buffer);
-
-//         serviceLog('Running spleeter...', userId);
-//         exec(`spleeter separate ${audioDir}/${newFileName} -p spleeter:5stems -o ${audioDir}`, async (error) => {
-//             if (error) {
-//                 serviceLog(`Spleeter execution error: ${error}`, userId);
-//                 return;
-//             }
-
-//             serviceLog('Spleeter processing complete, archiving the results...', userId);
-//             const output = fs.createWriteStream(`./audio/${newUUID}/${newUUID}.zip`);
-//             const archive = archiver('zip', { zlib: { level: 9 } });
-//             archive.directory(`./audio/${newUUID}/${newUUID}`, false);
-//             archive.pipe(output);
-//             archive.finalize();
-
-            
-//         output.on('close', async () => {
-//           serviceLog('Archive created, uploading to Firebase Storage...', userId);
-//           const bucket = storage.bucket('spleetee.appspot.com');
-
-//           // Updating the file path to include the user's UID
-//           const firebaseFilePath = `files/${userId}/${newUUID}.zip`;
-
-//           await bucket.upload(`${audioDir}/${newUUID}.zip`, {
-//               destination: firebaseFilePath
-//           });
-
-//           const file = bucket.file(firebaseFilePath);
-//           const [url] = await file.getSignedUrl({ version: 'v4', action: 'read', expires: Date.now() + 1000 * 60 * 60 });
-//           serviceLog('Upload complete. Updating RTDB with download URL...', userId);
-//           await snapshot.ref.update({ Output: url, JobStatus: 'complete' });
-
-//           serviceLog(`Deleting directory: ${audioDir}`, userId);
-//           await fs.remove(audioDir);
-//       });
-//         });
-
-//     } catch (error) {
-//         serviceLog(`An error occurred: ${error}`, userId);
-//     }
-// });
